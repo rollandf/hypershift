@@ -11,9 +11,18 @@ import (
 	"github.com/openshift/hypershift/support/upsert"
 	appsv1 "k8s.io/api/apps/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	k8sutilspointer "k8s.io/utils/pointer"
 	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const (
+	//TODO set image from config?
+	imageCAPA = "quay.io/edge-infrastructure/cluster-api-provider-agent:latest-2021-12-30"
 )
 
 type Agent struct{}
@@ -45,8 +54,88 @@ func (p Agent) ReconcileCAPIInfraCR(ctx context.Context, c client.Client, create
 }
 
 func (p Agent) CAPIProviderDeploymentSpec(hcluster *hyperv1.HostedCluster, tokenMinterImage string) (*appsv1.DeploymentSpec, error) {
-	// It is expected that cluster-api-provider-agent and the Infrastructure Operator are installed as a prerequisite
-	return nil, nil
+	deploymentSpec := &appsv1.DeploymentSpec{
+		Replicas: k8sutilspointer.Int32Ptr(1),
+		Selector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				"control-plane": "controller-manager",
+			},
+		},
+		Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					"control-plane": "controller-manager",
+				},
+			},
+			Spec: corev1.PodSpec{
+				TerminationGracePeriodSeconds: k8sutilspointer.Int64Ptr(10),
+				ServiceAccountName:            "cluster-api-provider-agent-controller-manager",
+				SecurityContext: &corev1.PodSecurityContext{
+					RunAsNonRoot: k8sutilspointer.BoolPtr(true),
+				},
+				Containers: []corev1.Container{
+					{
+						Name:    "manager",
+						Image:   imageCAPA,
+						Command: []string{"/manager"},
+						Args: []string{
+							"--health-probe-bind-address=:8081",
+							"--metrics-bind-address=127.0.0.1:8080",
+							"--leader-elect",
+						},
+						LivenessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path: "/healthz",
+									Port: intstr.FromString("8081"),
+								},
+							},
+							InitialDelaySeconds: 15,
+							PeriodSeconds:       20,
+						},
+						ReadinessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path: "/readyz",
+									Port: intstr.FromString("8081"),
+								},
+							},
+							InitialDelaySeconds: 15,
+							PeriodSeconds:       20,
+						},
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("200m"),
+								corev1.ResourceMemory: resource.MustParse("100Mi"),
+							},
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("100m"),
+								corev1.ResourceMemory: resource.MustParse("20Mi"),
+							},
+						},
+					},
+					{
+						Name:  "kube-rbac-proxy",
+						Image: "gcr.io/kubebuilder/kube-rbac-proxy:v0.8.0",
+						Args: []string{
+							"--secure-listen-address=0.0.0.0:8443",
+							"--upstream=http://127.0.0.1:8080/",
+							"--logtostderr=true",
+							"--v=10",
+						},
+						Ports: []corev1.ContainerPort{
+							{
+								Name:          "https",
+								ContainerPort: 8443,
+								Protocol:      corev1.ProtocolTCP,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	return deploymentSpec, nil
 }
 
 func (p Agent) ReconcileCredentials(ctx context.Context, c client.Client, createOrUpdate upsert.CreateOrUpdateFN,
